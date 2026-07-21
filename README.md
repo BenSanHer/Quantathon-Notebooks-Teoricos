@@ -1,0 +1,1 @@
+En este repositorio coloco Notebooks en donde se aborden diversos temas para el reto 3 del Quantathon CR 2026 con intención de apoyar a mi equipo en la competencia y que todos estemos en la misma pagina
