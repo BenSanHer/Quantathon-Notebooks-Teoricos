@@ -7,6 +7,8 @@ definición se pierda al importarlas desde este módulo.
 
 from __future__ import annotations
 
+from time import perf_counter
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.linalg import eigh
@@ -724,6 +726,8 @@ def vqe_ising(
     seed: int = 42,
     mostrar_cada: int = 25,
     calcular_exacto: bool = True,
+    parametros_iniciales=None,
+    verbose: bool = True,
 ):
     """Ejecuta un VQE del TFIM con ADAM y simulación exacta sin shots."""
     qml, pnp = _dependencias_vqe()
@@ -752,21 +756,28 @@ def vqe_ising(
         ansatz_ising(parametros, n_qubits=n_qubits, n_layers=n_layers)
         return qml.state()
 
-    rng = np.random.default_rng(seed)
-    parametros = pnp.array(
-        rng.uniform(
-            low=-0.1,
-            high=0.1,
-            size=(n_layers + 1, n_qubits, 3),
-        ),
-        requires_grad=True,
-    )
+    if parametros_iniciales is None:
+        rng = np.random.default_rng(seed)
+        parametros = pnp.array(
+            rng.uniform(
+                low=-0.1,
+                high=0.1,
+                size=(n_layers + 1, n_qubits, 3),
+            ),
+            requires_grad=True,
+        )
+    else:
+        parametros = pnp.array(
+            np.asarray(parametros_iniciales),
+            requires_grad=True,
+        )
     optimizador = qml.AdamOptimizer(stepsize=learning_rate)
 
     historial = [float(circuito_energia(parametros))]
     pasos_estables = 0
 
-    print(f"Energía inicial: {historial[0]:.12f}")
+    if verbose:
+        print(f"Energía inicial: {historial[0]:.12f}")
 
     for step in range(1, max_steps + 1):
         parametros = optimizador.step(circuito_energia, parametros)
@@ -774,7 +785,7 @@ def vqe_ising(
         historial.append(energia_actual)
         diferencia = abs(historial[-1] - historial[-2])
 
-        if step % mostrar_cada == 0 or step == 1:
+        if verbose and (step % mostrar_cada == 0 or step == 1):
             print(
                 f"Paso {step:4d} | "
                 f"E = {energia_actual:.12f} | "
@@ -783,7 +794,8 @@ def vqe_ising(
 
         pasos_estables = pasos_estables + 1 if diferencia < tol else 0
         if pasos_estables >= patience:
-            print(f"\nConvergencia alcanzada en el paso {step}.")
+            if verbose:
+                print(f"\nConvergencia alcanzada en el paso {step}.")
             break
 
     energia_vqe = float(circuito_energia(parametros))
@@ -804,12 +816,13 @@ def vqe_ising(
         resultado["energia_exacta"] = energia_exacta
         resultado["error_absoluto"] = abs(energia_vqe - energia_exacta)
 
-        print("\nResultado final")
-        print("------------------------------")
-        print(f"Energía VQE:    {energia_vqe:.12f}")
-        print(f"Energía exacta: {energia_exacta:.12f}")
-        print(f"Error absoluto: {resultado['error_absoluto']:.3e}")
-    elif calcular_exacto:
+        if verbose:
+            print("\nResultado final")
+            print("------------------------------")
+            print(f"Energía VQE:    {energia_vqe:.12f}")
+            print(f"Energía exacta: {energia_exacta:.12f}")
+            print(f"Error absoluto: {resultado['error_absoluto']:.3e}")
+    elif calcular_exacto and verbose:
         print("\nNo se realizó diagonalización exacta: n_qubits > 12.")
 
     return resultado
@@ -1024,4 +1037,277 @@ def graficar_observables_vqe(tabla) -> None:
         plt.grid(alpha=0.3)
         plt.legend()
         plt.show()
+
+
+# ======================================================================================
+# FLUJO REPRODUCIBLE DEL CHALLENGE 3
+# ======================================================================================
+
+
+def estilo_graficas_tfim() -> None:
+    """Configura un estilo compacto y consistente para el notebook."""
+    plt.style.use("seaborn-v0_8-whitegrid")
+    plt.rcParams.update(
+        {
+            "figure.figsize": (8.5, 4.8),
+            "figure.dpi": 120,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.titleweight": "bold",
+            "legend.frameon": False,
+        }
+    )
+
+
+def observables_tfim_estado(
+    estado: Statevector,
+    periodic: bool = True,
+) -> dict[str, float]:
+    """Calcula Mz, Mz², Mx y la correlación ZZ media."""
+    n_q = estado.num_qubits
+    operadores = {
+        "mz": magnetizacion_z(n_q),
+        "mz2": magnetizacion_z_cuadrada(n_q),
+        "mx": magnetizacion_x(n_q),
+        "czz": correlacion_zz_vecinos(n_q, periodic=periodic),
+    }
+    return {
+        nombre: float(np.real_if_close(estado.expectation_value(operador)))
+        for nombre, operador in operadores.items()
+    }
+
+
+def fidelidad_estados(
+    estado_a: Statevector,
+    estado_b: Statevector,
+) -> float:
+    """Fidelidad pura |<a|b>|²."""
+    return float(abs(np.vdot(estado_a.data, estado_b.data)) ** 2)
+
+
+def convergencia_trotter_tfim(
+    valores_r,
+    J: float = 1.0,
+    h: float = 1.0,
+    n_q: int = 6,
+    t: float = 1.0,
+) -> dict[str, np.ndarray]:
+    """Compara la evolución Trotter contra ED al variar los pasos r."""
+    exacto = evolve_tfim_exact(
+        t=t, h=h, J=J, n_qubits=n_q, r=1, periodic=True
+    )
+    obs_exacto = observables_tfim_estado(exacto, periodic=True)
+    fidelidades = []
+    errores_mz = []
+    errores_czz = []
+
+    for r in valores_r:
+        trotter = evolucion_tfim_trotter_cerrada(
+            J=J, h=h, n_q=n_q, r=int(r), t=t
+        )
+        obs_trotter = observables_tfim_estado(trotter, periodic=True)
+        fidelidades.append(fidelidad_estados(exacto, trotter))
+        errores_mz.append(abs(obs_trotter["mz"] - obs_exacto["mz"]))
+        errores_czz.append(abs(obs_trotter["czz"] - obs_exacto["czz"]))
+
+    return {
+        "r": np.asarray(valores_r, dtype=int),
+        "dt": t / np.asarray(valores_r, dtype=float),
+        "fidelidad": np.asarray(fidelidades),
+        "error_mz": np.asarray(errores_mz),
+        "error_czz": np.asarray(errores_czz),
+    }
+
+
+def escalado_trotter_tfim(
+    tamanos=(4, 6, 8, 10, 12),
+    J: float = 1.0,
+    h: float = 1.0,
+    r: int = 4,
+    t: float = 1.0,
+) -> list[dict]:
+    """Evalúa costo y autoconsistencia r frente a 2r para varios tamaños."""
+    resultados = []
+    for n_q in tamanos:
+        circuito_r = circuito_tfim_trotter_cerrado(
+            J=J, h=h, n_q=int(n_q), r=r, t=t
+        )
+        circuito_2r = circuito_tfim_trotter_cerrado(
+            J=J, h=h, n_q=int(n_q), r=2 * r, t=t
+        )
+        inicio = perf_counter()
+        estado_r = Statevector.from_instruction(circuito_r)
+        estado_2r = Statevector.from_instruction(circuito_2r)
+        duracion = perf_counter() - inicio
+        resultados.append(
+            {
+                "n_q": int(n_q),
+                "profundidad": circuito_r.depth(),
+                "compuertas": circuito_r.size(),
+                "fidelidad_r_2r": fidelidad_estados(
+                    estado_r, estado_2r
+                ),
+                "tiempo_s": duracion,
+                "memoria_estado_mb": 16 * (2**int(n_q)) / 2**20,
+            }
+        )
+        del estado_r, estado_2r
+    return resultados
+
+
+def dinamica_tfim_comparada(
+    J: float,
+    h: float,
+    n_q: int,
+    r: int,
+    tiempos,
+) -> dict[str, np.ndarray]:
+    """Dinámica Trotter y ED con observables y fidelidad en cada tiempo."""
+    datos = {
+        "tiempos": np.asarray(tiempos, dtype=float),
+        "mz_trotter": [],
+        "mz_exacta": [],
+        "czz_trotter": [],
+        "czz_exacta": [],
+        "fidelidad": [],
+    }
+    for tiempo in datos["tiempos"]:
+        trotter = evolucion_tfim_trotter_cerrada(
+            J=J, h=h, n_q=n_q, r=r, t=float(tiempo)
+        )
+        exacta = evolve_tfim_exact(
+            t=float(tiempo),
+            h=h,
+            J=J,
+            n_qubits=n_q,
+            r=1,
+            periodic=True,
+        )
+        obs_trotter = observables_tfim_estado(trotter, periodic=True)
+        obs_exacta = observables_tfim_estado(exacta, periodic=True)
+        datos["mz_trotter"].append(obs_trotter["mz"])
+        datos["mz_exacta"].append(obs_exacta["mz"])
+        datos["czz_trotter"].append(obs_trotter["czz"])
+        datos["czz_exacta"].append(obs_exacta["czz"])
+        datos["fidelidad"].append(fidelidad_estados(trotter, exacta))
+    for clave in datos:
+        datos[clave] = np.asarray(datos[clave])
+    return datos
+
+
+def barrido_fase_ed_tfim(
+    valores_h_sobre_J=(0.5, 1.0, 2.0),
+    J: float = 1.0,
+    n_q: int = 6,
+) -> list[dict]:
+    """Observables del estado fundamental exacto para campos seleccionados."""
+    filas = []
+    for razon in valores_h_sobre_J:
+        energia, estado = estado_base_ising_cerrado(
+            J=J,
+            h=float(razon) * J,
+            n_q=n_q,
+            devolver_energia=True,
+        )
+        obs = observables_tfim_estado(estado, periodic=True)
+        filas.append(
+            {
+                "h/J": float(razon),
+                "E0/N": energia / n_q,
+                "Mz": obs["mz"],
+                "sqrt_Mz2": np.sqrt(max(obs["mz2"], 0.0)),
+                "Mx": obs["mx"],
+                "Czz": obs["czz"],
+            }
+        )
+    return filas
+
+
+def barrido_vqe_tfim_unico(
+    valores_h_sobre_J=(0.5, 1.0, 2.0),
+    J: float = 1.0,
+    n_layers: int = 3,
+    learning_rate: float = 0.04,
+    max_steps: int = 500,
+    seed: int = 17,
+) -> tuple[list[dict], dict]:
+    """Ejecuta exactamente un VQE de 6 espines por cada valor de h/J."""
+    n_qubits = 6
+    filas = []
+    detalles = {}
+    for razon in valores_h_sobre_J:
+        h = float(razon) * J
+        rng = np.random.default_rng(seed)
+        parametros_iniciales = rng.normal(
+            0.0, 0.03, size=(n_layers + 1, n_qubits, 3)
+        )
+        angulo_producto = np.arcsin(min(1.0, abs(h) / (2.0 * abs(J))))
+        parametros_iniciales[0, :, 0] = 0.0
+        parametros_iniciales[0, :, 1] = angulo_producto
+        parametros_iniciales[0, :, 2] = 0.0
+        resultado = vqe_ising(
+            n_qubits=n_qubits,
+            J=J,
+            h=h,
+            n_layers=n_layers,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            tol=1e-8,
+            patience=25,
+            seed=seed,
+            mostrar_cada=max_steps + 1,
+            calcular_exacto=False,
+            parametros_iniciales=parametros_iniciales,
+            verbose=False,
+        )
+        qml, _ = _dependencias_vqe()
+        matriz_h = np.asarray(
+            qml.matrix(
+                resultado["hamiltoniano"],
+                wire_order=range(n_qubits),
+            ),
+            dtype=complex,
+        )
+        energias_ed, estados_ed = np.linalg.eigh(matriz_h)
+        energia_exacta = float(energias_ed[0])
+        estado_exacto = estados_ed[:, 0]
+        estado_vqe = np.asarray(resultado["estado_vqe"], dtype=complex)
+        obs_vqe = medir_observables_tfim(estado_vqe, n_qubits)
+        obs_exacto = medir_observables_tfim(estado_exacto, n_qubits)
+        fidelidad = float(abs(np.vdot(estado_exacto, estado_vqe)) ** 2)
+        fidelidad_subespacio_2 = float(
+            np.sum(
+                np.abs(estados_ed[:, :2].conj().T @ estado_vqe) ** 2
+            )
+        )
+        fila = {
+            "h/J": float(razon),
+            "E_VQE/N": resultado["energia_vqe"] / n_qubits,
+            "E_ED/N": energia_exacta / n_qubits,
+            "error_E": abs(resultado["energia_vqe"] - energia_exacta),
+            "error_E_por_spin": abs(
+                resultado["energia_vqe"] - energia_exacta
+            ) / n_qubits,
+            "error_E_relativo_pct": 100.0
+            * abs(resultado["energia_vqe"] - energia_exacta)
+            / abs(energia_exacta),
+            "fidelidad": fidelidad,
+            "fidelidad_subespacio_2": fidelidad_subespacio_2,
+            "infidelidad_F0": 1.0 - fidelidad,
+            "infidelidad_subespacio_2": 1.0 - fidelidad_subespacio_2,
+            "gap_ED": float(energias_ed[1] - energias_ed[0]),
+            "Mz2_VQE": obs_vqe["Mz2"],
+            "Mz2_ED": obs_exacto["Mz2"],
+            "error_Mz2": abs(obs_vqe["Mz2"] - obs_exacto["Mz2"]),
+            "Mx_VQE": obs_vqe["Mx"],
+            "Mx_ED": obs_exacto["Mx"],
+            "error_Mx": abs(obs_vqe["Mx"] - obs_exacto["Mx"]),
+            "Czz_VQE": obs_vqe["Czz"],
+            "Czz_ED": obs_exacto["Czz"],
+            "error_Czz": abs(obs_vqe["Czz"] - obs_exacto["Czz"]),
+            "pasos": resultado["pasos_realizados"],
+        }
+        filas.append(fila)
+        detalles[float(razon)] = resultado
+    return filas, detalles
 
