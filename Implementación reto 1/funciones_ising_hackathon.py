@@ -624,3 +624,404 @@ def barrido_temporal_tfim_trotter_cerrado(
         "r": r
     }
 
+
+# ======================================================================================
+# VQE CON PENNYLANE
+# Funciones trasladadas desde "Implementacion del sistema.ipynb".
+# ======================================================================================
+
+def _dependencias_vqe():
+    """Importa las dependencias opcionales sólo cuando se ejecuta el VQE."""
+    try:
+        import pennylane as qml
+        from pennylane import numpy as pnp
+    except ImportError as error:
+        raise ImportError(
+            "Las funciones VQE requieren PennyLane y sus dependencias."
+        ) from error
+    return qml, pnp
+
+
+def hamiltoniano_ising_pennylane(
+    n_qubits: int,
+    J: float,
+    h: float,
+):
+    """
+    Hamiltoniano TFIM periódico para PennyLane:
+
+        H = -J sum_i Z_i Z_{i+1} - h sum_i X_i.
+
+    Se usa un nombre específico para no reemplazar a ``hamiltoniano_ising``,
+    que construye el operador equivalente con Qiskit.
+    """
+    qml, _ = _dependencias_vqe()
+
+    if n_qubits < 2:
+        raise ValueError("El sistema debe tener al menos 2 qubits.")
+
+    enlaces = (
+        [(0, 1)]
+        if n_qubits == 2
+        else [(i, (i + 1) % n_qubits) for i in range(n_qubits)]
+    )
+
+    coeficientes = []
+    operadores = []
+
+    for i, j in enlaces:
+        coeficientes.append(-J)
+        operadores.append(qml.PauliZ(i) @ qml.PauliZ(j))
+
+    for i in range(n_qubits):
+        coeficientes.append(-h)
+        operadores.append(qml.PauliX(i))
+
+    return qml.dot(coeficientes, operadores)
+
+
+def bloque_rotaciones(parametros_bloque, n_qubits: int) -> None:
+    """Aplica RX, RY y RZ sobre cada qubit."""
+    qml, _ = _dependencias_vqe()
+
+    for q in range(n_qubits):
+        qml.RX(parametros_bloque[q, 0], wires=q)
+        qml.RY(parametros_bloque[q, 1], wires=q)
+        qml.RZ(parametros_bloque[q, 2], wires=q)
+
+
+def anillo_cnots(n_qubits: int) -> None:
+    """Entrelaza vecinos; para dos qubits usa una sola CNOT."""
+    qml, _ = _dependencias_vqe()
+
+    if n_qubits == 2:
+        qml.CNOT(wires=[0, 1])
+        return
+
+    for control in range(n_qubits):
+        objetivo = (control + 1) % n_qubits
+        qml.CNOT(wires=[control, objetivo])
+
+
+def ansatz_ising(parametros, n_qubits: int, n_layers: int) -> None:
+    """Ansatz de rotaciones locales y anillos de CNOT."""
+    bloque_rotaciones(parametros[0], n_qubits)
+
+    for layer in range(n_layers):
+        anillo_cnots(n_qubits)
+        bloque_rotaciones(parametros[layer + 1], n_qubits)
+
+
+def vqe_ising(
+    n_qubits: int,
+    J: float,
+    h: float,
+    n_layers: int = 1,
+    learning_rate: float = 0.05,
+    max_steps: int = 500,
+    tol: float = 1e-8,
+    patience: int = 15,
+    seed: int = 42,
+    mostrar_cada: int = 25,
+    calcular_exacto: bool = True,
+):
+    """Ejecuta un VQE del TFIM con ADAM y simulación exacta sin shots."""
+    qml, pnp = _dependencias_vqe()
+
+    if n_qubits < 2:
+        raise ValueError("n_qubits debe ser al menos 2.")
+    if n_layers < 1:
+        raise ValueError("n_layers debe ser al menos 1.")
+    if learning_rate <= 0:
+        raise ValueError("learning_rate debe ser positivo.")
+
+    H = hamiltoniano_ising_pennylane(
+        n_qubits=n_qubits,
+        J=J,
+        h=h,
+    )
+    dev = qml.device("default.qubit", wires=n_qubits, shots=None)
+
+    @qml.qnode(dev, interface="autograd", diff_method="best")
+    def circuito_energia(parametros):
+        ansatz_ising(parametros, n_qubits=n_qubits, n_layers=n_layers)
+        return qml.expval(H)
+
+    @qml.qnode(dev, interface="autograd", diff_method="best")
+    def circuito_estado(parametros):
+        ansatz_ising(parametros, n_qubits=n_qubits, n_layers=n_layers)
+        return qml.state()
+
+    rng = np.random.default_rng(seed)
+    parametros = pnp.array(
+        rng.uniform(
+            low=-0.1,
+            high=0.1,
+            size=(n_layers + 1, n_qubits, 3),
+        ),
+        requires_grad=True,
+    )
+    optimizador = qml.AdamOptimizer(stepsize=learning_rate)
+
+    historial = [float(circuito_energia(parametros))]
+    pasos_estables = 0
+
+    print(f"Energía inicial: {historial[0]:.12f}")
+
+    for step in range(1, max_steps + 1):
+        parametros = optimizador.step(circuito_energia, parametros)
+        energia_actual = float(circuito_energia(parametros))
+        historial.append(energia_actual)
+        diferencia = abs(historial[-1] - historial[-2])
+
+        if step % mostrar_cada == 0 or step == 1:
+            print(
+                f"Paso {step:4d} | "
+                f"E = {energia_actual:.12f} | "
+                f"ΔE = {diferencia:.3e}"
+            )
+
+        pasos_estables = pasos_estables + 1 if diferencia < tol else 0
+        if pasos_estables >= patience:
+            print(f"\nConvergencia alcanzada en el paso {step}.")
+            break
+
+    energia_vqe = float(circuito_energia(parametros))
+    resultado = {
+        "energia_vqe": energia_vqe,
+        "parametros_optimos": parametros,
+        "historial": np.asarray(historial),
+        "estado_vqe": np.asarray(circuito_estado(parametros)),
+        "hamiltoniano": H,
+        "circuito_energia": circuito_energia,
+        "circuito_estado": circuito_estado,
+        "pasos_realizados": len(historial) - 1,
+    }
+
+    if calcular_exacto and n_qubits <= 12:
+        matriz_H = qml.matrix(H, wire_order=range(n_qubits))
+        energia_exacta = float(np.linalg.eigvalsh(np.asarray(matriz_H))[0])
+        resultado["energia_exacta"] = energia_exacta
+        resultado["error_absoluto"] = abs(energia_vqe - energia_exacta)
+
+        print("\nResultado final")
+        print("------------------------------")
+        print(f"Energía VQE:    {energia_vqe:.12f}")
+        print(f"Energía exacta: {energia_exacta:.12f}")
+        print(f"Error absoluto: {resultado['error_absoluto']:.3e}")
+    elif calcular_exacto:
+        print("\nNo se realizó diagonalización exacta: n_qubits > 12.")
+
+    return resultado
+
+
+def matriz_operador(operador, n_qubits: int) -> np.ndarray:
+    """Regresa la matriz completa de un operador PennyLane."""
+    qml, _ = _dependencias_vqe()
+    return np.asarray(
+        qml.matrix(operador, wire_order=range(n_qubits)),
+        dtype=complex,
+    )
+
+
+def valor_esperado_estado(
+    estado: np.ndarray,
+    operador_matriz: np.ndarray,
+) -> float:
+    """Calcula <psi|O|psi>."""
+    estado = np.asarray(estado, dtype=complex)
+    return float(np.real(np.vdot(estado, operador_matriz @ estado)))
+
+
+def matrices_observables_tfim(n_qubits: int) -> dict[str, np.ndarray]:
+    """Construye matrices de Mz, Mz², Mx y Czz con frontera periódica."""
+    qml, _ = _dependencias_vqe()
+
+    if n_qubits < 2:
+        raise ValueError("Se necesitan al menos 2 qubits.")
+
+    dimension = 2 ** n_qubits
+    Mz = np.zeros((dimension, dimension), dtype=complex)
+    Mx = np.zeros((dimension, dimension), dtype=complex)
+
+    for i in range(n_qubits):
+        Mz += matriz_operador(qml.PauliZ(i), n_qubits)
+        Mx += matriz_operador(qml.PauliX(i), n_qubits)
+
+    Mz /= n_qubits
+    Mx /= n_qubits
+    Mz2 = Mz @ Mz
+
+    parejas = (
+        [(0, 1)]
+        if n_qubits == 2
+        else [(i, (i + 1) % n_qubits) for i in range(n_qubits)]
+    )
+    Czz = np.zeros((dimension, dimension), dtype=complex)
+
+    for i, j in parejas:
+        Czz += matriz_operador(qml.PauliZ(i) @ qml.PauliZ(j), n_qubits)
+    Czz /= len(parejas)
+
+    return {"Mz": Mz, "Mz2": Mz2, "Mx": Mx, "Czz": Czz}
+
+
+def medir_observables_tfim(
+    estado: np.ndarray,
+    n_qubits: int,
+) -> dict[str, float]:
+    """Mide Mz, Mz², Mx y Czz sobre un vector de estado."""
+    operadores = matrices_observables_tfim(n_qubits)
+    return {
+        nombre: valor_esperado_estado(estado, matriz)
+        for nombre, matriz in operadores.items()
+    }
+
+
+def estado_base_exacto(H, n_qubits: int) -> tuple[float, np.ndarray]:
+    """Diagonaliza exactamente un Hamiltoniano PennyLane."""
+    qml, _ = _dependencias_vqe()
+    matriz_H = np.asarray(
+        qml.matrix(H, wire_order=range(n_qubits)),
+        dtype=complex,
+    )
+    energias, estados = np.linalg.eigh(matriz_H)
+    return float(np.real(energias[0])), estados[:, 0]
+
+
+def mejor_vqe_ising(
+    n_qubits: int,
+    J: float,
+    h: float,
+    n_layers: int = 3,
+    learning_rate: float = 0.03,
+    max_steps: int = 800,
+    seeds: tuple[int, ...] = (3, 7, 11, 19, 42),
+):
+    """Ejecuta varios reinicios y conserva el VQE de menor energía."""
+    mejor_resultado = None
+
+    for seed in seeds:
+        resultado = vqe_ising(
+            n_qubits=n_qubits,
+            J=J,
+            h=h,
+            n_layers=n_layers,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            tol=1e-9,
+            patience=25,
+            seed=seed,
+            mostrar_cada=max_steps + 1,
+            calcular_exacto=False,
+        )
+
+        if (
+            mejor_resultado is None
+            or resultado["energia_vqe"] < mejor_resultado["energia_vqe"]
+        ):
+            mejor_resultado = resultado
+
+    return mejor_resultado
+
+
+def comparar_vqe_tfim(
+    n_qubits: int = 4,
+    J: float = 1.0,
+    valores_h: tuple[float, ...] = (0.5, 1.0, 2.0),
+    n_layers: int = 3,
+    learning_rate: float = 0.03,
+    max_steps: int = 800,
+    seeds: tuple[int, ...] = (3, 7, 11, 19, 42),
+):
+    """Compara VQE y diagonalización exacta para varios campos."""
+    try:
+        import pandas as pd
+    except ImportError as error:
+        raise ImportError(
+            "comparar_vqe_tfim requiere pandas para construir la tabla."
+        ) from error
+
+    filas = []
+    estados = {}
+
+    for h in valores_h:
+        print("\n" + "=" * 60)
+        print(f"J = {J}, h = {h}, h/J = {h / J}")
+        print("=" * 60)
+
+        resultado_vqe = mejor_vqe_ising(
+            n_qubits=n_qubits,
+            J=J,
+            h=h,
+            n_layers=n_layers,
+            learning_rate=learning_rate,
+            max_steps=max_steps,
+            seeds=seeds,
+        )
+        H = resultado_vqe["hamiltoniano"]
+        estado_vqe = np.asarray(resultado_vqe["estado_vqe"], dtype=complex)
+        energia_vqe = float(resultado_vqe["energia_vqe"])
+        energia_exacta, estado_exacto = estado_base_exacto(H, n_qubits)
+        obs_vqe = medir_observables_tfim(estado_vqe, n_qubits)
+        obs_exactos = medir_observables_tfim(estado_exacto, n_qubits)
+        fidelidad = float(np.abs(np.vdot(estado_exacto, estado_vqe)) ** 2)
+
+        filas.append({
+            "h": h,
+            "h/J": h / J,
+            "E_VQE": energia_vqe,
+            "E_exacta": energia_exacta,
+            "error_E": abs(energia_vqe - energia_exacta),
+            "fidelidad": fidelidad,
+            "Mz_VQE": obs_vqe["Mz"],
+            "Mz_exacto": obs_exactos["Mz"],
+            "Mz2_VQE": obs_vqe["Mz2"],
+            "Mz2_exacto": obs_exactos["Mz2"],
+            "Mx_VQE": obs_vqe["Mx"],
+            "Mx_exacto": obs_exactos["Mx"],
+            "Czz_VQE": obs_vqe["Czz"],
+            "Czz_exacto": obs_exactos["Czz"],
+        })
+        estados[h] = {
+            "estado_vqe": estado_vqe,
+            "estado_exacto": estado_exacto,
+            "parametros": resultado_vqe["parametros_optimos"],
+            "resultado_vqe": resultado_vqe,
+        }
+
+    return pd.DataFrame(filas), estados
+
+
+def graficar_observables_vqe(tabla) -> None:
+    """Grafica los observables VQE frente a la solución exacta."""
+    comparaciones = [
+        ("Mz_VQE", "Mz_exacto", r"$\langle M_z \rangle$"),
+        ("Mz2_VQE", "Mz2_exacto", r"$\langle M_z^2 \rangle$"),
+        ("Mx_VQE", "Mx_exacto", r"$\langle M_x \rangle$"),
+        ("Czz_VQE", "Czz_exacto", r"$C_{ZZ}$"),
+    ]
+
+    for columna_vqe, columna_exacta, ylabel in comparaciones:
+        plt.figure(figsize=(7, 4))
+        plt.plot(
+            tabla["h/J"],
+            tabla[columna_vqe],
+            marker="o",
+            label="VQE",
+        )
+        plt.plot(
+            tabla["h/J"],
+            tabla[columna_exacta],
+            marker="s",
+            linestyle="--",
+            label="Exacto",
+        )
+        plt.axvline(1.0, linestyle=":", label=r"$h/J=1$")
+        plt.xlabel(r"$h/J$")
+        plt.ylabel(ylabel)
+        plt.title(f"Comparación VQE vs exacta: {ylabel}")
+        plt.grid(alpha=0.3)
+        plt.legend()
+        plt.show()
+
